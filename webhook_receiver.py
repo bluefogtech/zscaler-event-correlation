@@ -268,7 +268,7 @@ def rows_as_dicts(rows):
 def render_alert_table(rows):
     body = []
     body.append("<!doctype html><html><head><meta charset='utf-8'>")
-    body.append("<title>Webhook Alerts</title>")
+    body.append("<title>Zscaler alerts</title>")
     body.append(
         "<style>"
         "body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:24px;}"
@@ -280,7 +280,7 @@ def render_alert_table(rows):
         "a{color:#0b5cab;}"
         "</style></head><body>"
     )
-    body.append("<table><caption>Webhook Alerts</caption><thead><tr>")
+    body.append("<table><caption>Zscaler alerts</caption><thead><tr>")
     for column in ALERT_COLUMNS:
         body.append(f"<th>{html.escape(column)}</th>")
     body.append("</tr></thead><tbody>")
