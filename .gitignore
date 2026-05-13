@@ -1,0 +1,14 @@
+*
+!.gitignore
+!webhook_receiver.py
+!README.md
+!requirements.txt
+!*.service
+
+# Runtime storage and generated files.
+receiver.log
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+__pycache__/
+*.pyc
