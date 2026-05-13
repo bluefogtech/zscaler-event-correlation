@@ -21,8 +21,6 @@ ALERT_COLUMNS = [
     "id",
     "received_at",
     "source_ip",
-    "method",
-    "path",
     "alert_id",
     "event",
     "alias",
@@ -32,7 +30,6 @@ ALERT_COLUMNS = [
     "severity",
     "rule_name",
     "message",
-    "url",
     "create_time",
     "start_time",
     "impacted_device_count",
@@ -42,6 +39,41 @@ ALERT_COLUMNS = [
     "osver_count",
     "zloc_count",
     "criteria_string",
+]
+
+DB_COLUMNS = [
+    "id",
+    "received_at",
+    "source_ip",
+    "source_port",
+    "content_type",
+    "user_agent",
+    "headers_json",
+    "raw_payload",
+    "payload_json",
+    "alert_id",
+    "event",
+    "alias",
+    "alert_type",
+    "type",
+    "status",
+    "severity",
+    "rule_name",
+    "message",
+    "description",
+    "text",
+    "zdx_url",
+    "version",
+    "create_time",
+    "start_time",
+    "impacted_device_count",
+    "impacted_user_count",
+    "geolocation_count",
+    "dept_count",
+    "osver_count",
+    "zloc_count",
+    "criteria_string",
+    "criteria_json",
 ]
 
 
@@ -64,51 +96,85 @@ def connect_db():
     return conn
 
 
+def create_alerts_table(conn, table_name="webhook_alerts"):
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {table_name} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            received_at TEXT NOT NULL,
+            source_ip TEXT,
+            source_port INTEGER,
+            content_type TEXT,
+            user_agent TEXT,
+            headers_json TEXT NOT NULL,
+            raw_payload TEXT,
+            payload_json TEXT,
+            alert_id TEXT,
+            event TEXT,
+            alias TEXT,
+            alert_type TEXT,
+            type TEXT,
+            status TEXT,
+            severity TEXT,
+            rule_name TEXT,
+            message TEXT,
+            description TEXT,
+            text TEXT,
+            zdx_url TEXT,
+            version TEXT,
+            create_time INTEGER,
+            start_time INTEGER,
+            impacted_device_count INTEGER,
+            impacted_user_count INTEGER,
+            geolocation_count INTEGER,
+            dept_count INTEGER,
+            osver_count INTEGER,
+            zloc_count INTEGER,
+            criteria_string TEXT,
+            criteria_json TEXT
+        )
+        """
+    )
+
+
+def table_columns(conn, table_name):
+    return [row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})")]
+
+
+def migrate_alerts_table(conn):
+    existing_columns = table_columns(conn, "webhook_alerts")
+    if not existing_columns:
+        create_alerts_table(conn)
+        return
+
+    desired_columns = DB_COLUMNS
+    if existing_columns == desired_columns:
+        return
+
+    conn.execute("ALTER TABLE webhook_alerts RENAME TO webhook_alerts_old")
+    create_alerts_table(conn)
+
+    old_columns = table_columns(conn, "webhook_alerts_old")
+    columns_to_copy = [column for column in desired_columns if column in old_columns]
+    where_clause = "WHERE method = 'POST'" if "method" in old_columns else ""
+    if columns_to_copy:
+        column_list = ", ".join(columns_to_copy)
+        conn.execute(
+            f"""
+            INSERT INTO webhook_alerts ({column_list})
+            SELECT {column_list}
+            FROM webhook_alerts_old
+            {where_clause}
+            """
+        )
+    conn.execute("DROP TABLE webhook_alerts_old")
+
+
 def init_db():
     with DB_LOCK:
         with connect_db() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS webhook_alerts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    received_at TEXT NOT NULL,
-                    source_ip TEXT,
-                    source_port INTEGER,
-                    method TEXT NOT NULL,
-                    path TEXT NOT NULL,
-                    content_type TEXT,
-                    user_agent TEXT,
-                    headers_json TEXT NOT NULL,
-                    raw_payload TEXT,
-                    payload_json TEXT,
-                    alert_id TEXT,
-                    event TEXT,
-                    alias TEXT,
-                    alert_type TEXT,
-                    type TEXT,
-                    status TEXT,
-                    severity TEXT,
-                    rule_name TEXT,
-                    message TEXT,
-                    description TEXT,
-                    text TEXT,
-                    url TEXT,
-                    zdx_url TEXT,
-                    version TEXT,
-                    create_time INTEGER,
-                    start_time INTEGER,
-                    impacted_device_count INTEGER,
-                    impacted_user_count INTEGER,
-                    geolocation_count INTEGER,
-                    dept_count INTEGER,
-                    osver_count INTEGER,
-                    zloc_count INTEGER,
-                    criteria_string TEXT,
-                    criteria_json TEXT
-                )
-                """
-            )
+            migrate_alerts_table(conn)
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_webhook_alerts_received_at "
                 "ON webhook_alerts(received_at)"
@@ -123,7 +189,7 @@ def init_db():
             )
 
 
-def store_alert(received_at, client_address, method, path, headers, raw_payload, parsed):
+def store_alert(received_at, client_address, headers, raw_payload, parsed):
     payload = parsed if isinstance(parsed, dict) else {}
     payload_json = (
         json.dumps(parsed, sort_keys=True, separators=(",", ":"))
@@ -141,8 +207,6 @@ def store_alert(received_at, client_address, method, path, headers, raw_payload,
         "received_at": received_at,
         "source_ip": client_address[0],
         "source_port": client_address[1],
-        "method": method,
-        "path": path,
         "content_type": headers.get("content-type"),
         "user_agent": headers.get("user-agent"),
         "headers_json": json.dumps(dict(headers.items()), sort_keys=True),
@@ -159,7 +223,6 @@ def store_alert(received_at, client_address, method, path, headers, raw_payload,
         "message": payload.get("message"),
         "description": payload.get("description"),
         "text": payload.get("text"),
-        "url": payload.get("url"),
         "zdx_url": payload.get("zdxUrl"),
         "version": payload.get("version"),
         "create_time": parse_int(payload.get("createTime")),
@@ -183,13 +246,6 @@ def store_alert(received_at, client_address, method, path, headers, raw_payload,
                 values,
             )
             return cursor.lastrowid
-
-
-def delete_non_post_rows():
-    with DB_LOCK:
-        with connect_db() as conn:
-            cursor = conn.execute("DELETE FROM webhook_alerts WHERE method != 'POST'")
-            return cursor.rowcount
 
 
 def get_alert_rows(limit=100):
@@ -232,13 +288,7 @@ def render_alert_table(rows):
         body.append("<tr>")
         for column in ALERT_COLUMNS:
             value = row[column]
-            if column == "url" and value:
-                cell = (
-                    f"<a href='{html.escape(str(value), quote=True)}'>"
-                    f"{html.escape(str(value))}</a>"
-                )
-            else:
-                cell = "" if value is None else html.escape(str(value))
+            cell = "" if value is None else html.escape(str(value))
             body.append(f"<td>{cell}</td>")
         body.append("</tr>")
     body.append("</tbody></table></body></html>")
@@ -323,8 +373,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
             row_id = store_alert(
                 received_at,
                 self.client_address,
-                self.command,
-                self.path,
                 self.headers,
                 text,
                 parsed,
@@ -364,18 +412,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Webhook receiver with SQLite storage")
     parser.add_argument("--list", action="store_true", help="print stored alerts as a table")
     parser.add_argument("--limit", type=int, default=25, help="number of alerts to show")
-    parser.add_argument(
-        "--delete-non-post",
-        action="store_true",
-        help="delete rows that were stored from non-POST requests",
-    )
     args = parser.parse_args()
 
     init_db()
-    if args.delete_non_post:
-        deleted = delete_non_post_rows()
-        print(f"Deleted {deleted} non-POST rows")
-        sys.exit(0)
     if args.list:
         print_alerts(args.limit)
         sys.exit(0)

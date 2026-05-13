@@ -37,6 +37,9 @@ python3 /home/ubuntu/webhook_receiver.py --list --limit 25
 
 Alert data is stored in `webhook_alerts`. Common fields such as `alert_id`,
 `status`, `severity`, `rule_name`, impact counts, and `criteria_string` are
-stored as queryable columns. The complete request headers and raw payload are
-also retained as JSON/text columns so the same records can be sent to
-Elasticsearch later without losing fields.
+stored as queryable columns. Request method, request path, and the structured
+payload `url` field are not stored as table columns.
+
+The complete request headers and raw payload are also retained as JSON/text
+columns so the same records can be sent to Elasticsearch later without losing
+fields.
