@@ -41,6 +41,8 @@ ALERT_COLUMNS = [
     "criteria_string",
 ]
 
+DISPLAY_COLUMNS = ["record"] + ALERT_COLUMNS
+
 DB_COLUMNS = [
     "id",
     "received_at",
@@ -265,7 +267,15 @@ def rows_as_dicts(rows):
     return [dict(row) for row in rows]
 
 
+def numbered_rows(rows):
+    return [
+        {"record": index, **dict(row)}
+        for index, row in enumerate(rows, start=1)
+    ]
+
+
 def render_alert_table(rows):
+    display_rows = numbered_rows(rows)
     body = []
     body.append("<!doctype html><html><head><meta charset='utf-8'>")
     body.append("<title>Zscaler alerts</title>")
@@ -281,12 +291,12 @@ def render_alert_table(rows):
         "</style></head><body>"
     )
     body.append("<table><caption>Zscaler alerts</caption><thead><tr>")
-    for column in ALERT_COLUMNS:
+    for column in DISPLAY_COLUMNS:
         body.append(f"<th>{html.escape(column)}</th>")
     body.append("</tr></thead><tbody>")
-    for row in rows:
+    for row in display_rows:
         body.append("<tr>")
-        for column in ALERT_COLUMNS:
+        for column in DISPLAY_COLUMNS:
             value = row[column]
             cell = "" if value is None else html.escape(str(value))
             body.append(f"<td>{cell}</td>")
@@ -297,26 +307,26 @@ def render_alert_table(rows):
 
 def rows_as_csv(rows):
     output = StringIO()
-    writer = csv.DictWriter(output, fieldnames=ALERT_COLUMNS)
+    writer = csv.DictWriter(output, fieldnames=DISPLAY_COLUMNS)
     writer.writeheader()
-    for row in rows:
-        writer.writerow({column: row[column] for column in ALERT_COLUMNS})
+    for row in numbered_rows(rows):
+        writer.writerow({column: row[column] for column in DISPLAY_COLUMNS})
     return output.getvalue()
 
 
 def print_alerts(limit):
-    rows = rows_as_dicts(get_alert_rows(limit))
+    rows = numbered_rows(get_alert_rows(limit))
     widths = {
         column: max([len(column)] + [len(str(row.get(column, ""))) for row in rows])
-        for column in ALERT_COLUMNS
+        for column in DISPLAY_COLUMNS
     }
-    print(" | ".join(column.ljust(widths[column]) for column in ALERT_COLUMNS))
-    print("-+-".join("-" * widths[column] for column in ALERT_COLUMNS))
+    print(" | ".join(column.ljust(widths[column]) for column in DISPLAY_COLUMNS))
+    print("-+-".join("-" * widths[column] for column in DISPLAY_COLUMNS))
     for row in rows:
         print(
             " | ".join(
                 str(row.get(column, "") or "").replace("\n", " ").ljust(widths[column])
-                for column in ALERT_COLUMNS
+                for column in DISPLAY_COLUMNS
             )
         )
 
@@ -332,7 +342,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
     def _handle_alert_view(self):
         rows = get_alert_rows()
         if self.path == "/alerts.json":
-            body = json.dumps(rows_as_dicts(rows), indent=2).encode("utf-8")
+            body = json.dumps(numbered_rows(rows), indent=2).encode("utf-8")
             self._send_bytes(200, "application/json; charset=utf-8", body)
             return
         if self.path == "/alerts.csv":
