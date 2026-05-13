@@ -604,9 +604,21 @@ def numbered_rows(rows):
     ]
 
 
+def render_cell(column, value):
+    if value is None:
+        return ""
+    escaped_value = html.escape(str(value))
+    if column == "log_detail":
+        return f"<pre class='log-detail'>{escaped_value}</pre>"
+    return escaped_value
+
+
 def render_table(caption, rows, columns):
     display_rows = numbered_rows(rows)
-    body = [f"<table><caption>{html.escape(caption)}</caption><thead><tr>"]
+    body = [
+        "<div class='table-wrap'>",
+        f"<table><caption>{html.escape(caption)}</caption><thead><tr>",
+    ]
     for column in columns:
         body.append(f"<th>{html.escape(column)}</th>")
     body.append("</tr></thead><tbody>")
@@ -614,10 +626,11 @@ def render_table(caption, rows, columns):
         body.append("<tr>")
         for column in columns:
             value = row[column]
-            cell = "" if value is None else html.escape(str(value))
-            body.append(f"<td>{cell}</td>")
+            css_class = " class='log-detail-cell'" if column == "log_detail" else ""
+            cell = render_cell(column, value)
+            body.append(f"<td{css_class}>{cell}</td>")
         body.append("</tr>")
-    body.append("</tbody></table>")
+    body.append("</tbody></table></div>")
     return "".join(body)
 
 
@@ -629,11 +642,17 @@ def render_alert_page(zscaler_rows, fortinet_rows):
         "<style>"
         "body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:24px;}"
         "section{margin-bottom:36px;}"
+        ".table-wrap{max-width:100%;overflow:auto;}"
         "table{border-collapse:collapse;width:100%;font-size:13px;}"
         "th,td{border:1px solid #ddd;padding:6px 8px;text-align:left;vertical-align:top;}"
         "th{background:#f4f6f8;position:sticky;top:0;}"
         "td{max-width:420px;overflow-wrap:anywhere;}"
         "caption{text-align:left;font-weight:700;margin-bottom:12px;font-size:20px;}"
+        ".log-detail-cell{min-width:520px;max-width:720px;}"
+        ".log-detail{max-height:120px;overflow:auto;margin:0;white-space:pre-wrap;"
+        "font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px;"
+        "line-height:1.35;background:#f8fafc;border:1px solid #d9e1ea;"
+        "border-radius:4px;padding:8px;}"
         "a{color:#0b5cab;}"
         "</style></head><body>"
     )
