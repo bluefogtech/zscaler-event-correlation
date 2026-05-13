@@ -43,6 +43,35 @@ ALERT_COLUMNS = [
 
 DISPLAY_COLUMNS = ["record"] + ALERT_COLUMNS
 
+FORTINET_COLUMNS = [
+    "id",
+    "received_at",
+    "source_ip",
+    "adom",
+    "from_device",
+    "type",
+    "timestamp",
+    "alertid",
+    "alerttime",
+    "severity",
+    "triggername",
+    "subject",
+    "devid",
+    "devname",
+    "devtype",
+    "eventtype",
+    "subtype",
+    "logtype",
+    "extrainfo",
+    "vdom",
+    "logcount",
+    "readflag",
+    "ackflag",
+    "log_detail",
+]
+
+FORTINET_DISPLAY_COLUMNS = ["record"] + FORTINET_COLUMNS
+
 DB_COLUMNS = [
     "id",
     "received_at",
@@ -76,6 +105,60 @@ DB_COLUMNS = [
     "zloc_count",
     "criteria_string",
     "criteria_json",
+]
+
+FORTINET_DB_COLUMNS = [
+    "id",
+    "received_at",
+    "source_ip",
+    "source_port",
+    "content_type",
+    "user_agent",
+    "headers_json",
+    "raw_payload",
+    "payload_json",
+    "notification_json",
+    "alert_json",
+    "adom",
+    "apiver",
+    "from_device",
+    "timestamp",
+    "type",
+    "ackflag",
+    "alertid",
+    "alerttime",
+    "devid",
+    "devname",
+    "devtype",
+    "ephostname",
+    "epid",
+    "epip",
+    "epmac",
+    "epname",
+    "eposname",
+    "eposversion",
+    "euid",
+    "euname",
+    "eventtype",
+    "extrainfo",
+    "fctuid",
+    "firstlogtime",
+    "groupby1",
+    "groupby2",
+    "groupby3",
+    "indicator",
+    "lastlogtime",
+    "log_detail",
+    "log_length",
+    "logcount",
+    "logtype",
+    "readflag",
+    "severity",
+    "subject",
+    "subtype",
+    "tag",
+    "triggername",
+    "vdom",
 ]
 
 
@@ -139,6 +222,66 @@ def create_alerts_table(conn, table_name="webhook_alerts"):
     )
 
 
+def create_fortinet_table(conn, table_name="fortinet_alerts"):
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {table_name} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            received_at TEXT NOT NULL,
+            source_ip TEXT,
+            source_port INTEGER,
+            content_type TEXT,
+            user_agent TEXT,
+            headers_json TEXT NOT NULL,
+            raw_payload TEXT,
+            payload_json TEXT,
+            notification_json TEXT NOT NULL,
+            alert_json TEXT NOT NULL,
+            adom TEXT,
+            apiver INTEGER,
+            from_device TEXT,
+            timestamp INTEGER,
+            type TEXT,
+            ackflag TEXT,
+            alertid TEXT,
+            alerttime TEXT,
+            devid TEXT,
+            devname TEXT,
+            devtype TEXT,
+            ephostname TEXT,
+            epid TEXT,
+            epip TEXT,
+            epmac TEXT,
+            epname TEXT,
+            eposname TEXT,
+            eposversion TEXT,
+            euid TEXT,
+            euname TEXT,
+            eventtype TEXT,
+            extrainfo TEXT,
+            fctuid TEXT,
+            firstlogtime TEXT,
+            groupby1 TEXT,
+            groupby2 TEXT,
+            groupby3 TEXT,
+            indicator TEXT,
+            lastlogtime TEXT,
+            log_detail TEXT,
+            log_length INTEGER,
+            logcount TEXT,
+            logtype TEXT,
+            readflag TEXT,
+            severity TEXT,
+            subject TEXT,
+            subtype TEXT,
+            tag TEXT,
+            triggername TEXT,
+            vdom TEXT
+        )
+        """
+    )
+
+
 def table_columns(conn, table_name):
     return [row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})")]
 
@@ -172,11 +315,40 @@ def migrate_alerts_table(conn):
     conn.execute("DROP TABLE webhook_alerts_old")
 
 
+def migrate_fortinet_table(conn):
+    existing_columns = table_columns(conn, "fortinet_alerts")
+    if not existing_columns:
+        create_fortinet_table(conn)
+        return
+
+    if existing_columns == FORTINET_DB_COLUMNS:
+        return
+
+    conn.execute("ALTER TABLE fortinet_alerts RENAME TO fortinet_alerts_old")
+    create_fortinet_table(conn)
+
+    old_columns = table_columns(conn, "fortinet_alerts_old")
+    columns_to_copy = [
+        column for column in FORTINET_DB_COLUMNS if column in old_columns
+    ]
+    if columns_to_copy:
+        column_list = ", ".join(columns_to_copy)
+        conn.execute(
+            f"""
+            INSERT INTO fortinet_alerts ({column_list})
+            SELECT {column_list}
+            FROM fortinet_alerts_old
+            """
+        )
+    conn.execute("DROP TABLE fortinet_alerts_old")
+
+
 def init_db():
     with DB_LOCK:
         with connect_db() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             migrate_alerts_table(conn)
+            migrate_fortinet_table(conn)
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_webhook_alerts_received_at "
                 "ON webhook_alerts(received_at)"
@@ -188,6 +360,18 @@ def init_db():
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_webhook_alerts_status "
                 "ON webhook_alerts(status)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_fortinet_alerts_received_at "
+                "ON fortinet_alerts(received_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_fortinet_alerts_alertid "
+                "ON fortinet_alerts(alertid)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_fortinet_alerts_severity "
+                "ON fortinet_alerts(severity)"
             )
 
 
@@ -250,12 +434,158 @@ def store_alert(received_at, client_address, headers, raw_payload, parsed):
             return cursor.lastrowid
 
 
+def get_fortinet_notification(parsed):
+    if not isinstance(parsed, dict):
+        return None
+    notification = parsed.get("fortianalyzer_notification")
+    return notification if isinstance(notification, dict) else None
+
+
+def store_fortinet_alerts(received_at, client_address, headers, raw_payload, parsed):
+    notification = get_fortinet_notification(parsed)
+    if notification is None:
+        return []
+
+    payload_json = json.dumps(parsed, sort_keys=True, separators=(",", ":"))
+    notification_json = json.dumps(
+        notification, sort_keys=True, separators=(",", ":")
+    )
+    data = notification.get("data")
+    alerts = data if isinstance(data, list) else [notification]
+    row_ids = []
+
+    with DB_LOCK:
+        with connect_db() as conn:
+            for alert in alerts:
+                alert_data = alert if isinstance(alert, dict) else {"value": alert}
+                values = {
+                    "received_at": received_at,
+                    "source_ip": client_address[0],
+                    "source_port": client_address[1],
+                    "content_type": headers.get("content-type"),
+                    "user_agent": headers.get("user-agent"),
+                    "headers_json": json.dumps(dict(headers.items()), sort_keys=True),
+                    "raw_payload": raw_payload,
+                    "payload_json": payload_json,
+                    "notification_json": notification_json,
+                    "alert_json": json.dumps(
+                        alert_data, sort_keys=True, separators=(",", ":")
+                    ),
+                    "adom": notification.get("adom"),
+                    "apiver": parse_int(notification.get("apiver")),
+                    "from_device": notification.get("from"),
+                    "timestamp": parse_int(notification.get("timestamp")),
+                    "type": notification.get("type"),
+                    "ackflag": alert_data.get("ackflag"),
+                    "alertid": alert_data.get("alertid"),
+                    "alerttime": alert_data.get("alerttime"),
+                    "devid": alert_data.get("devid"),
+                    "devname": alert_data.get("devname"),
+                    "devtype": alert_data.get("devtype"),
+                    "ephostname": alert_data.get("ephostname"),
+                    "epid": alert_data.get("epid"),
+                    "epip": alert_data.get("epip"),
+                    "epmac": alert_data.get("epmac"),
+                    "epname": alert_data.get("epname"),
+                    "eposname": alert_data.get("eposname"),
+                    "eposversion": alert_data.get("eposversion"),
+                    "euid": alert_data.get("euid"),
+                    "euname": alert_data.get("euname"),
+                    "eventtype": alert_data.get("eventtype"),
+                    "extrainfo": alert_data.get("extrainfo"),
+                    "fctuid": alert_data.get("fctuid"),
+                    "firstlogtime": alert_data.get("firstlogtime"),
+                    "groupby1": alert_data.get("groupby1"),
+                    "groupby2": alert_data.get("groupby2"),
+                    "groupby3": alert_data.get("groupby3"),
+                    "indicator": alert_data.get("indicator"),
+                    "lastlogtime": alert_data.get("lastlogtime"),
+                    "log_detail": alert_data.get("log-detail"),
+                    "log_length": parse_int(alert_data.get("log-length")),
+                    "logcount": alert_data.get("logcount"),
+                    "logtype": alert_data.get("logtype"),
+                    "readflag": alert_data.get("readflag"),
+                    "severity": alert_data.get("severity"),
+                    "subject": alert_data.get("subject"),
+                    "subtype": alert_data.get("subtype"),
+                    "tag": alert_data.get("tag"),
+                    "triggername": alert_data.get("triggername"),
+                    "vdom": alert_data.get("vdom"),
+                }
+                columns = ", ".join(values.keys())
+                placeholders = ", ".join(f":{key}" for key in values)
+                cursor = conn.execute(
+                    f"INSERT INTO fortinet_alerts ({columns}) VALUES ({placeholders})",
+                    values,
+                )
+                row_ids.append(cursor.lastrowid)
+    return row_ids
+
+
+def migrate_existing_fortinet_payloads():
+    with DB_LOCK:
+        with connect_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, received_at, source_ip, source_port, content_type,
+                       user_agent, headers_json, raw_payload, payload_json
+                FROM webhook_alerts
+                WHERE payload_json LIKE '%fortianalyzer_notification%'
+                """
+            ).fetchall()
+
+    migrated_ids = []
+    for row in rows:
+        try:
+            parsed = json.loads(row["payload_json"] or row["raw_payload"] or "{}")
+            headers = json.loads(row["headers_json"] or "{}")
+        except json.JSONDecodeError:
+            continue
+
+        notification = get_fortinet_notification(parsed)
+        if notification is None:
+            continue
+
+        row_ids = store_fortinet_alerts(
+            row["received_at"],
+            (row["source_ip"], row["source_port"] or 0),
+            headers,
+            row["raw_payload"] or "",
+            parsed,
+        )
+        if row_ids:
+            migrated_ids.append(row["id"])
+
+    if migrated_ids:
+        placeholders = ", ".join("?" for _ in migrated_ids)
+        with DB_LOCK:
+            with connect_db() as conn:
+                conn.execute(
+                    f"DELETE FROM webhook_alerts WHERE id IN ({placeholders})",
+                    migrated_ids,
+                )
+    return len(migrated_ids)
+
+
 def get_alert_rows(limit=100):
     with connect_db() as conn:
         return conn.execute(
             f"""
             SELECT {", ".join(ALERT_COLUMNS)}
             FROM webhook_alerts
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+
+def get_fortinet_rows(limit=100):
+    with connect_db() as conn:
+        return conn.execute(
+            f"""
+            SELECT {", ".join(FORTINET_COLUMNS)}
+            FROM fortinet_alerts
             ORDER BY id DESC
             LIMIT ?
             """,
@@ -274,14 +604,31 @@ def numbered_rows(rows):
     ]
 
 
-def render_alert_table(rows):
+def render_table(caption, rows, columns):
     display_rows = numbered_rows(rows)
+    body = [f"<table><caption>{html.escape(caption)}</caption><thead><tr>"]
+    for column in columns:
+        body.append(f"<th>{html.escape(column)}</th>")
+    body.append("</tr></thead><tbody>")
+    for row in display_rows:
+        body.append("<tr>")
+        for column in columns:
+            value = row[column]
+            cell = "" if value is None else html.escape(str(value))
+            body.append(f"<td>{cell}</td>")
+        body.append("</tr>")
+    body.append("</tbody></table>")
+    return "".join(body)
+
+
+def render_alert_page(zscaler_rows, fortinet_rows):
     body = []
     body.append("<!doctype html><html><head><meta charset='utf-8'>")
-    body.append("<title>Zscaler alerts</title>")
+    body.append("<title>Security alerts</title>")
     body.append(
         "<style>"
         "body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:24px;}"
+        "section{margin-bottom:36px;}"
         "table{border-collapse:collapse;width:100%;font-size:13px;}"
         "th,td{border:1px solid #ddd;padding:6px 8px;text-align:left;vertical-align:top;}"
         "th{background:#f4f6f8;position:sticky;top:0;}"
@@ -290,18 +637,11 @@ def render_alert_table(rows):
         "a{color:#0b5cab;}"
         "</style></head><body>"
     )
-    body.append("<table><caption>Zscaler alerts</caption><thead><tr>")
-    for column in DISPLAY_COLUMNS:
-        body.append(f"<th>{html.escape(column)}</th>")
-    body.append("</tr></thead><tbody>")
-    for row in display_rows:
-        body.append("<tr>")
-        for column in DISPLAY_COLUMNS:
-            value = row[column]
-            cell = "" if value is None else html.escape(str(value))
-            body.append(f"<td>{cell}</td>")
-        body.append("</tr>")
-    body.append("</tbody></table></body></html>")
+    body.append("<section>")
+    body.append(render_table("Zscaler alerts", zscaler_rows, DISPLAY_COLUMNS))
+    body.append("</section><section>")
+    body.append(render_table("Fortinet alerts", fortinet_rows, FORTINET_DISPLAY_COLUMNS))
+    body.append("</section></body></html>")
     return "".join(body)
 
 
@@ -311,6 +651,15 @@ def rows_as_csv(rows):
     writer.writeheader()
     for row in numbered_rows(rows):
         writer.writerow({column: row[column] for column in DISPLAY_COLUMNS})
+    return output.getvalue()
+
+
+def fortinet_rows_as_csv(rows):
+    output = StringIO()
+    writer = csv.DictWriter(output, fieldnames=FORTINET_DISPLAY_COLUMNS)
+    writer.writeheader()
+    for row in numbered_rows(rows):
+        writer.writerow({column: row[column] for column in FORTINET_DISPLAY_COLUMNS})
     return output.getvalue()
 
 
@@ -331,6 +680,23 @@ def print_alerts(limit):
         )
 
 
+def print_fortinet_alerts(limit):
+    rows = numbered_rows(get_fortinet_rows(limit))
+    widths = {
+        column: max([len(column)] + [len(str(row.get(column, ""))) for row in rows])
+        for column in FORTINET_DISPLAY_COLUMNS
+    }
+    print(" | ".join(column.ljust(widths[column]) for column in FORTINET_DISPLAY_COLUMNS))
+    print("-+-".join("-" * widths[column] for column in FORTINET_DISPLAY_COLUMNS))
+    for row in rows:
+        print(
+            " | ".join(
+                str(row.get(column, "") or "").replace("\n", " ").ljust(widths[column])
+                for column in FORTINET_DISPLAY_COLUMNS
+            )
+        )
+
+
 class WebhookHandler(BaseHTTPRequestHandler):
     def _send_bytes(self, status, content_type, body):
         self.send_response(status)
@@ -341,6 +707,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
     def _handle_alert_view(self):
         rows = get_alert_rows()
+        fortinet_rows = get_fortinet_rows()
         if self.path == "/alerts.json":
             body = json.dumps(numbered_rows(rows), indent=2).encode("utf-8")
             self._send_bytes(200, "application/json; charset=utf-8", body)
@@ -349,7 +716,20 @@ class WebhookHandler(BaseHTTPRequestHandler):
             body = rows_as_csv(rows).encode("utf-8")
             self._send_bytes(200, "text/csv; charset=utf-8", body)
             return
-        body = render_alert_table(rows).encode("utf-8")
+        body = render_alert_page(rows, fortinet_rows).encode("utf-8")
+        self._send_bytes(200, "text/html; charset=utf-8", body)
+
+    def _handle_fortinet_view(self):
+        rows = get_fortinet_rows()
+        if self.path == "/fortinet.json":
+            body = json.dumps(numbered_rows(rows), indent=2).encode("utf-8")
+            self._send_bytes(200, "application/json; charset=utf-8", body)
+            return
+        if self.path == "/fortinet.csv":
+            body = fortinet_rows_as_csv(rows).encode("utf-8")
+            self._send_bytes(200, "text/csv; charset=utf-8", body)
+            return
+        body = render_alert_page(get_alert_rows(), rows).encode("utf-8")
         self._send_bytes(200, "text/html; charset=utf-8", body)
 
     def _handle_request(self):
@@ -380,14 +760,24 @@ class WebhookHandler(BaseHTTPRequestHandler):
             log(text)
 
         if self.command == "POST":
-            row_id = store_alert(
-                received_at,
-                self.client_address,
-                self.headers,
-                text,
-                parsed,
-            )
-            log(f"SQLite row: {row_id}")
+            if get_fortinet_notification(parsed) is not None:
+                row_ids = store_fortinet_alerts(
+                    received_at,
+                    self.client_address,
+                    self.headers,
+                    text,
+                    parsed,
+                )
+                log(f"Fortinet SQLite rows: {row_ids}")
+            else:
+                row_id = store_alert(
+                    received_at,
+                    self.client_address,
+                    self.headers,
+                    text,
+                    parsed,
+                )
+                log(f"SQLite row: {row_id}")
         else:
             log("SQLite row: skipped non-POST request")
 
@@ -402,6 +792,9 @@ class WebhookHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/alerts", "/alerts.json", "/alerts.csv"):
             self._handle_alert_view()
+            return
+        if self.path in ("/fortinet", "/fortinet.json", "/fortinet.csv"):
+            self._handle_fortinet_view()
             return
         self._handle_request()
 
@@ -421,10 +814,27 @@ class WebhookHandler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Webhook receiver with SQLite storage")
     parser.add_argument("--list", action="store_true", help="print stored alerts as a table")
+    parser.add_argument(
+        "--list-fortinet",
+        action="store_true",
+        help="print stored Fortinet alerts as a table",
+    )
+    parser.add_argument(
+        "--migrate-fortinet",
+        action="store_true",
+        help="move previously misclassified Fortinet payloads into fortinet_alerts",
+    )
     parser.add_argument("--limit", type=int, default=25, help="number of alerts to show")
     args = parser.parse_args()
 
     init_db()
+    if args.migrate_fortinet:
+        migrated = migrate_existing_fortinet_payloads()
+        print(f"Migrated {migrated} Fortinet payload rows")
+        sys.exit(0)
+    if args.list_fortinet:
+        print_fortinet_alerts(args.limit)
+        sys.exit(0)
     if args.list:
         print_alerts(args.limit)
         sys.exit(0)
