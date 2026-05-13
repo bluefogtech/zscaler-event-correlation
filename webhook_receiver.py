@@ -185,6 +185,13 @@ def store_alert(received_at, client_address, method, path, headers, raw_payload,
             return cursor.lastrowid
 
 
+def delete_non_post_rows():
+    with DB_LOCK:
+        with connect_db() as conn:
+            cursor = conn.execute("DELETE FROM webhook_alerts WHERE method != 'POST'")
+            return cursor.rowcount
+
+
 def get_alert_rows(limit=100):
     with connect_db() as conn:
         return conn.execute(
@@ -312,16 +319,19 @@ class WebhookHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             log(text)
 
-        row_id = store_alert(
-            received_at,
-            self.client_address,
-            self.command,
-            self.path,
-            self.headers,
-            text,
-            parsed,
-        )
-        log(f"SQLite row: {row_id}")
+        if self.command == "POST":
+            row_id = store_alert(
+                received_at,
+                self.client_address,
+                self.command,
+                self.path,
+                self.headers,
+                text,
+                parsed,
+            )
+            log(f"SQLite row: {row_id}")
+        else:
+            log("SQLite row: skipped non-POST request")
 
         with open(LOG_FILE, "a", encoding="utf-8") as file:
             file.write("\n".join(lines) + "\n")
@@ -354,9 +364,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Webhook receiver with SQLite storage")
     parser.add_argument("--list", action="store_true", help="print stored alerts as a table")
     parser.add_argument("--limit", type=int, default=25, help="number of alerts to show")
+    parser.add_argument(
+        "--delete-non-post",
+        action="store_true",
+        help="delete rows that were stored from non-POST requests",
+    )
     args = parser.parse_args()
 
     init_db()
+    if args.delete_non_post:
+        deleted = delete_non_post_rows()
+        print(f"Deleted {deleted} non-POST rows")
+        sys.exit(0)
     if args.list:
         print_alerts(args.limit)
         sys.exit(0)
