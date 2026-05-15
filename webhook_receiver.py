@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 import argparse
+import base64
 import csv
 import html
 import json
+import os
+import re
 import sqlite3
 import sys
 import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import StringIO
@@ -14,8 +21,37 @@ from io import StringIO
 HOST = "0.0.0.0"
 PORT = 8080
 LOG_FILE = "/home/ubuntu/receiver.log"
+PROJECT_WEBHOOK_PATH = "/project-webhook"
+PROJECT_WEBHOOK_LOG_FILE = "/home/ubuntu/project_webhook.log"
 DB_FILE = "/home/ubuntu/alerts.sqlite"
+CLICKHOUSE_HOST = os.environ.get(
+    "CLICKHOUSE_HOST", "dz6sj5iq7e.us-central1.gcp.clickhouse.cloud"
+)
+CLICKHOUSE_PORT = int(os.environ.get("CLICKHOUSE_PORT", "8443"))
+CLICKHOUSE_SECURE = os.environ.get("CLICKHOUSE_SECURE", "1").lower() not in (
+    "0",
+    "false",
+    "no",
+)
+CLICKHOUSE_USER = os.environ.get("CLICKHOUSE_USER", "default")
+CLICKHOUSE_PASSWORD = os.environ.get("CLICKHOUSE_PASSWORD", "Fk4A_L83MRlsw")
+CLICKHOUSE_HTTP_URL = os.environ.get(
+    "CLICKHOUSE_HTTP_URL",
+    f"{'https' if CLICKHOUSE_SECURE else 'http'}://{CLICKHOUSE_HOST}:{CLICKHOUSE_PORT}/",
+)
+CLICKHOUSE_ALERT_PAYLOADS_TABLE = os.environ.get(
+    "CLICKHOUSE_ALERT_PAYLOADS_TABLE", "aiops.alert_payloads"
+)
+CLICKHOUSE_TIMEOUT_SECONDS = 5
+ZSCALER_TOKEN_URL = "https://esoczscalerlab.zslogin.net/oauth2/v1/token"
+ZSCALER_API_BASE_URL = "https://api.zsapi.net/zdx/v1"
+ZSCALER_CLIENT_ID = "102qek806d50626"
+ZSCALER_CLIENT_SECRET = "jQFIy4vURXP2mFznP8W3RPM31zT8N5E0jAxdx3jbkdsgCbM"
+ZSCALER_TOKEN_FILE = "/home/ubuntu/zscaler_bearer_token.txt"
+ZSCALER_ENRICHMENT_RETRY_DELAYS = (5, 15, 30)
 DB_LOCK = threading.Lock()
+PROJECT_WEBHOOK_LOG_LOCK = threading.Lock()
+CLICKHOUSE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
 
 ALERT_COLUMNS = [
     "id",
@@ -29,6 +65,9 @@ ALERT_COLUMNS = [
     "status",
     "severity",
     "rule_name",
+    "location",
+    "device_name",
+    "user_name",
     "message",
     "create_time",
     "start_time",
@@ -90,6 +129,9 @@ DB_COLUMNS = [
     "status",
     "severity",
     "rule_name",
+    "location",
+    "device_name",
+    "user_name",
     "message",
     "description",
     "text",
@@ -181,6 +223,84 @@ def connect_db():
     return conn
 
 
+def validate_clickhouse_table_name(table_name):
+    if not CLICKHOUSE_IDENTIFIER_RE.fullmatch(table_name):
+        raise ValueError(f"Invalid ClickHouse table name: {table_name}")
+    return table_name
+
+
+def clickhouse_request(query, data=None):
+    url = (
+        CLICKHOUSE_HTTP_URL.rstrip("/")
+        + "/?query="
+        + urllib.parse.quote(query, safe="")
+    )
+    body = data.encode("utf-8") if data is not None else b""
+    headers = {}
+    if CLICKHOUSE_USER or CLICKHOUSE_PASSWORD:
+        credentials = f"{CLICKHOUSE_USER}:{CLICKHOUSE_PASSWORD}".encode("utf-8")
+        headers["Authorization"] = (
+            "Basic " + base64.b64encode(credentials).decode("ascii")
+        )
+    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    with urllib.request.urlopen(
+        request, timeout=CLICKHOUSE_TIMEOUT_SECONDS
+    ) as response:
+        return response.read().decode("utf-8", errors="replace")
+
+
+def log_clickhouse_error(message):
+    line = f"{utc_now()} ClickHouse error: {message}"
+    with open(LOG_FILE, "a", encoding="utf-8") as file:
+        file.write(line + "\n")
+
+
+def init_clickhouse():
+    table_name = validate_clickhouse_table_name(CLICKHOUSE_ALERT_PAYLOADS_TABLE)
+    clickhouse_request(
+        f"""
+        CREATE TABLE IF NOT EXISTS {table_name} (
+            payload_json Nullable(String),
+            payload_type LowCardinality(String)
+        )
+        ENGINE = MergeTree
+        ORDER BY tuple()
+        """
+    )
+    try:
+        clickhouse_request(
+            f"ALTER TABLE {table_name} RENAME COLUMN payload_tyoe TO payload_type"
+        )
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+        pass
+
+
+def insert_clickhouse_alert_payloads(payload_json, payload_type, count=1):
+    if count <= 0:
+        return
+    table_name = validate_clickhouse_table_name(CLICKHOUSE_ALERT_PAYLOADS_TABLE)
+    rows = [
+        json.dumps(
+            {"payload_json": payload_json, "payload_type": payload_type},
+            separators=(",", ":"),
+        )
+        for _ in range(count)
+    ]
+    clickhouse_request(
+        f"INSERT INTO {table_name} (payload_json, payload_type) FORMAT JSONEachRow",
+        "\n".join(rows) + "\n",
+    )
+
+
+def store_clickhouse_alert_payload(payload_json, payload_type, count=1):
+    try:
+        insert_clickhouse_alert_payloads(payload_json, payload_type, count)
+    except (ValueError, urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as error:
+        log_clickhouse_error(
+            f"failed to insert {count} {payload_type} row(s): {error}"
+        )
+
+
 def create_alerts_table(conn, table_name="webhook_alerts"):
     conn.execute(
         f"""
@@ -202,6 +322,9 @@ def create_alerts_table(conn, table_name="webhook_alerts"):
             status TEXT,
             severity TEXT,
             rule_name TEXT,
+            location TEXT,
+            device_name TEXT,
+            user_name TEXT,
             message TEXT,
             description TEXT,
             text TEXT,
@@ -398,14 +521,17 @@ def store_alert(received_at, client_address, headers, raw_payload, parsed):
         "headers_json": json.dumps(dict(headers.items()), sort_keys=True),
         "raw_payload": raw_payload,
         "payload_json": payload_json,
-        "alert_id": payload.get("alertId"),
+        "alert_id": get_payload_alert_id(payload),
         "event": payload.get("event"),
         "alias": payload.get("alias"),
-        "alert_type": payload.get("alertType"),
+        "alert_type": payload.get("alertType") or payload.get("alert_type"),
         "type": payload.get("type"),
-        "status": payload.get("status"),
+        "status": payload.get("status") or payload.get("alert_status"),
         "severity": payload.get("severity"),
-        "rule_name": payload.get("ruleName"),
+        "rule_name": payload.get("ruleName") or payload.get("rule_name"),
+        "location": payload.get("location"),
+        "device_name": payload.get("deviceName"),
+        "user_name": payload.get("userName"),
         "message": payload.get("message"),
         "description": payload.get("description"),
         "text": payload.get("text"),
@@ -431,7 +557,187 @@ def store_alert(received_at, client_address, headers, raw_payload, parsed):
                 f"INSERT INTO webhook_alerts ({columns}) VALUES ({placeholders})",
                 values,
             )
-            return cursor.lastrowid
+            row_id = cursor.lastrowid
+    store_clickhouse_alert_payload(payload_json, "zscaler payload")
+    return row_id
+
+
+def request_zscaler_bearer_token():
+    form_data = urllib.parse.urlencode(
+        {
+            "grant_type": "client_credentials",
+            "client_id": ZSCALER_CLIENT_ID,
+            "client_secret": ZSCALER_CLIENT_SECRET,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        ZSCALER_TOKEN_URL,
+        data=form_data,
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        method="POST",
+    )
+
+    with urllib.request.urlopen(request, timeout=30) as response:
+        response_body = response.read().decode("utf-8", errors="replace")
+
+    try:
+        token_response = json.loads(response_body)
+    except json.JSONDecodeError:
+        token_response = {"raw_response": response_body}
+
+    token = (
+        token_response.get("access_token")
+        or token_response.get("token")
+        or token_response.get("bearer_token")
+    )
+    if not token:
+        raise RuntimeError("Zscaler token response did not include a bearer token")
+
+    fd = os.open(
+        ZSCALER_TOKEN_FILE,
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        0o600,
+    )
+    with os.fdopen(fd, "w", encoding="utf-8") as file:
+        file.write(token + "\n")
+
+    return token_response
+
+
+def get_stored_zscaler_bearer_token():
+    try:
+        with open(ZSCALER_TOKEN_FILE, "r", encoding="utf-8") as file:
+            token = file.read().strip()
+    except FileNotFoundError:
+        return None
+    return token or None
+
+
+def extract_zscaler_token(token_response):
+    return (
+        token_response.get("access_token")
+        or token_response.get("token")
+        or token_response.get("bearer_token")
+    )
+
+
+def get_zscaler_bearer_token():
+    token = get_stored_zscaler_bearer_token()
+    if token:
+        return token
+    return extract_zscaler_token(request_zscaler_bearer_token())
+
+
+def zscaler_api_get(path, token):
+    request = urllib.request.Request(
+        f"{ZSCALER_API_BASE_URL}{path}",
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        response_body = response.read().decode("utf-8", errors="replace")
+    try:
+        return json.loads(response_body) if response_body else {}
+    except json.JSONDecodeError:
+        return {"raw_response": response_body}
+
+
+def zscaler_api_get_with_refresh(path):
+    token = get_zscaler_bearer_token()
+    try:
+        return zscaler_api_get(path, token)
+    except urllib.error.HTTPError as error:
+        if error.code not in (401, 403):
+            raise
+        token = extract_zscaler_token(request_zscaler_bearer_token())
+        return zscaler_api_get(path, token)
+
+
+def get_payload_alert_id(payload):
+    if not isinstance(payload, dict):
+        return None
+    return payload.get("alertId") or payload.get("alert_id") or payload.get("id")
+
+
+def enrich_zscaler_alert_payload(payload):
+    if not isinstance(payload, dict):
+        return None
+
+    alert_id = get_payload_alert_id(payload)
+    if alert_id in (None, ""):
+        raise RuntimeError("Zscaler alert payload did not include an alert id")
+
+    alert_detail = zscaler_api_get_with_refresh(f"/alerts/{alert_id}")
+    locations = alert_detail.get("locations") if isinstance(alert_detail, dict) else None
+    if isinstance(locations, list) and locations:
+        first_location = locations[0]
+        if isinstance(first_location, dict):
+            payload["location"] = first_location.get("name")
+
+    affected_devices = zscaler_api_get_with_refresh(
+        f"/alerts/{alert_id}/affected_devices"
+    )
+    devices = (
+        affected_devices.get("devices")
+        if isinstance(affected_devices, dict)
+        else None
+    )
+    if isinstance(devices, list) and devices:
+        first_device = devices[0]
+        if isinstance(first_device, dict):
+            payload["deviceName"] = first_device.get("name")
+            payload["userName"] = first_device.get("userName")
+
+    return {
+        "alert_id": alert_id,
+        "location": payload.get("location"),
+        "device_name": payload.get("deviceName"),
+        "user_name": payload.get("userName"),
+    }
+
+
+def is_retryable_zscaler_enrichment_error(error):
+    if isinstance(error, TimeoutError):
+        return True
+    if isinstance(error, urllib.error.URLError):
+        return True
+    if isinstance(error, urllib.error.HTTPError):
+        if error.code in (408, 409, 425, 429, 500, 502, 503, 504):
+            return True
+        if error.code == 400:
+            body = error.read().decode("utf-8", errors="replace")
+            error.enrichment_body = body
+            return "Provided Alert ID not valid or more than 14 days old" in body
+    return False
+
+
+def enrich_zscaler_alert_payload_with_retry(payload, log):
+    delays = (0,) + ZSCALER_ENRICHMENT_RETRY_DELAYS
+    last_error = None
+    for attempt, delay in enumerate(delays, start=1):
+        if delay:
+            time.sleep(delay)
+        try:
+            return enrich_zscaler_alert_payload(payload)
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as error:
+            last_error = error
+            if not is_retryable_zscaler_enrichment_error(error):
+                raise
+            if attempt == len(delays):
+                break
+            log(
+                "Zscaler alert enrichment retrying: "
+                f"attempt={attempt}, next_delay_seconds={delays[attempt]}"
+            )
+    if last_error is not None:
+        raise last_error
+    return None
 
 
 def get_fortinet_notification(parsed):
@@ -519,6 +825,11 @@ def store_fortinet_alerts(received_at, client_address, headers, raw_payload, par
                     values,
                 )
                 row_ids.append(cursor.lastrowid)
+    store_clickhouse_alert_payload(
+        payload_json,
+        "fortinet payload",
+        count=len(row_ids),
+    )
     return row_ids
 
 
@@ -789,6 +1100,27 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 )
                 log(f"Fortinet SQLite rows: {row_ids}")
             else:
+                try:
+                    enrichment = enrich_zscaler_alert_payload_with_retry(parsed, log)
+                    if enrichment is not None:
+                        log(
+                            "Zscaler alert enrichment: "
+                            f"alert_id={enrichment['alert_id']}, "
+                            f"location={enrichment['location']}, "
+                            f"device_name={enrichment['device_name']}, "
+                            f"user_name={enrichment['user_name']}"
+                        )
+                except urllib.error.HTTPError as error:
+                    error_body = getattr(error, "enrichment_body", None)
+                    if error_body is None:
+                        error_body = error.read().decode("utf-8", errors="replace")
+                    log(
+                        "Zscaler alert enrichment failed: "
+                        f"HTTP {error.code} {error.reason}: {error_body}"
+                    )
+                except (urllib.error.URLError, TimeoutError, RuntimeError) as error:
+                    log(f"Zscaler alert enrichment failed: {error}")
+
                 row_id = store_alert(
                     received_at,
                     self.client_address,
@@ -847,6 +1179,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     init_db()
+    try:
+        init_clickhouse()
+    except (ValueError, urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as error:
+        log_clickhouse_error(f"initialization failed: {error}")
     if args.migrate_fortinet:
         migrated = migrate_existing_fortinet_payloads()
         print(f"Migrated {migrated} Fortinet payload rows")
@@ -861,4 +1197,5 @@ if __name__ == "__main__":
     server = ThreadingHTTPServer((HOST, PORT), WebhookHandler)
     print(f"Webhook receiver listening on http://{HOST}:{PORT}", flush=True)
     print(f"SQLite storage: {DB_FILE}", flush=True)
+    print(f"ClickHouse payload table: {CLICKHOUSE_ALERT_PAYLOADS_TABLE}", flush=True)
     server.serve_forever()
