@@ -530,7 +530,7 @@ def store_alert(received_at, client_address, headers, raw_payload, parsed):
         "alias": payload.get("alias"),
         "alert_type": payload.get("alertType") or payload.get("alert_type"),
         "type": payload.get("type"),
-        "status": payload.get("status") or payload.get("alert_status"),
+        "status": get_payload_status(payload),
         "severity": payload.get("severity"),
         "rule_name": payload.get("ruleName") or payload.get("rule_name"),
         "location": get_payload_location(payload),
@@ -667,6 +667,31 @@ def get_payload_alert_id(payload):
     if not isinstance(payload, dict):
         return None
     return payload.get("alertId") or payload.get("alert_id") or payload.get("id")
+
+
+def get_payload_status(payload):
+    if not isinstance(payload, dict):
+        return None
+    return payload.get("status") or payload.get("alert_status")
+
+
+def zscaler_alert_status_exists(alert_id, status):
+    if alert_id in (None, ""):
+        return False
+
+    query = "SELECT 1 FROM webhook_alerts WHERE alert_id = ? AND "
+    params = [alert_id]
+    if status is None:
+        query += "status IS NULL"
+    else:
+        query += "status = ?"
+        params.append(status)
+    query += " LIMIT 1"
+
+    with DB_LOCK:
+        with connect_db() as conn:
+            row = conn.execute(query, params).fetchone()
+    return row is not None
 
 
 def first_named_item_value(items):
@@ -1236,35 +1261,64 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 )
                 log(f"Fortinet SQLite rows: {row_ids}")
             else:
-                try:
-                    enrichment = enrich_zscaler_alert_payload_with_retry(parsed, log)
-                    if enrichment is not None:
-                        log(
-                            "Zscaler alert enrichment: "
-                            f"alert_id={enrichment['alert_id']}, "
-                            f"location={enrichment['location']}, "
-                            f"device_name={enrichment['device_name']}, "
-                            f"user_name={enrichment['user_name']}"
-                        )
-                except urllib.error.HTTPError as error:
-                    error_body = getattr(error, "enrichment_body", None)
-                    if error_body is None:
-                        error_body = error.read().decode("utf-8", errors="replace")
+                alert_id = get_payload_alert_id(parsed)
+                status = get_payload_status(parsed)
+                if zscaler_alert_status_exists(alert_id, status):
                     log(
-                        "Zscaler alert enrichment failed: "
-                        f"HTTP {error.code} {error.reason}: {error_body}"
+                        "Zscaler duplicate alert dropped: "
+                        f"alert_id={alert_id}, status={status}"
                     )
-                except (urllib.error.URLError, TimeoutError, RuntimeError) as error:
-                    log(f"Zscaler alert enrichment failed: {error}")
+                    row_id = None
+                    drop_reason = "duplicate alert"
+                else:
+                    enrichment = None
+                    enrichment_error = None
+                    try:
+                        enrichment = enrich_zscaler_alert_payload_with_retry(parsed, log)
+                        if enrichment is not None:
+                            log(
+                                "Zscaler alert enrichment: "
+                                f"alert_id={enrichment['alert_id']}, "
+                                f"location={enrichment['location']}, "
+                                f"device_name={enrichment['device_name']}, "
+                                f"user_name={enrichment['user_name']}"
+                            )
+                    except urllib.error.HTTPError as error:
+                        error_body = getattr(error, "enrichment_body", None)
+                        if error_body is None:
+                            error_body = error.read().decode("utf-8", errors="replace")
+                        enrichment_error = f"HTTP {error.code} {error.reason}: {error_body}"
+                        log(
+                            "Zscaler alert enrichment failed: "
+                            f"{enrichment_error}"
+                        )
+                    except (urllib.error.URLError, TimeoutError, RuntimeError) as error:
+                        enrichment_error = str(error)
+                        log(f"Zscaler alert enrichment failed: {error}")
 
-                row_id = store_alert(
-                    received_at,
-                    self.client_address,
-                    self.headers,
-                    text,
-                    parsed,
-                )
+                    if enrichment is None:
+                        log(
+                            "Zscaler alert dropped: enrichment incomplete"
+                            + (
+                                f" ({enrichment_error})"
+                                if enrichment_error
+                                else ""
+                            )
+                        )
+                        row_id = None
+                        drop_reason = "enrichment incomplete"
+                    else:
+                        row_id = store_alert(
+                            received_at,
+                            self.client_address,
+                            self.headers,
+                            text,
+                            parsed,
+                        )
+                        drop_reason = None
                 log(f"SQLite row: {row_id}")
+                if row_id is None:
+                    log(f"ClickHouse row: skipped {drop_reason}")
         else:
             log("SQLite row: skipped non-POST request")
 
