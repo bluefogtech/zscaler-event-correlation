@@ -2,6 +2,7 @@
 import argparse
 import base64
 import csv
+import hmac
 import html
 import json
 import os
@@ -24,6 +25,9 @@ LOG_FILE = "/home/ubuntu/receiver.log"
 PROJECT_WEBHOOK_PATH = "/project-webhook"
 PROJECT_WEBHOOK_LOG_FILE = "/home/ubuntu/project_webhook.log"
 DB_FILE = "/home/ubuntu/alerts.sqlite"
+ALERT_UI_USERNAME = os.environ.get("ALERT_UI_USERNAME", "alerts")
+ALERT_UI_PASSWORD = os.environ.get("ALERT_UI_PASSWORD", "ZDX-alerts-2026!")
+ALERT_UI_AUTH_REALM = "Security alerts"
 CLICKHOUSE_HOST = os.environ.get(
     "CLICKHOUSE_HOST", "dz6sj5iq7e.us-central1.gcp.clickhouse.cloud"
 )
@@ -80,7 +84,7 @@ ALERT_COLUMNS = [
     "criteria_string",
 ]
 
-DISPLAY_COLUMNS = ["record"] + ALERT_COLUMNS
+DISPLAY_COLUMNS = ["record", "payload_json"] + ALERT_COLUMNS
 
 FORTINET_COLUMNS = [
     "id",
@@ -109,7 +113,7 @@ FORTINET_COLUMNS = [
     "log_detail",
 ]
 
-FORTINET_DISPLAY_COLUMNS = ["record"] + FORTINET_COLUMNS
+FORTINET_DISPLAY_COLUMNS = ["record", "payload_json"] + FORTINET_COLUMNS
 
 DB_COLUMNS = [
     "id",
@@ -529,9 +533,9 @@ def store_alert(received_at, client_address, headers, raw_payload, parsed):
         "status": payload.get("status") or payload.get("alert_status"),
         "severity": payload.get("severity"),
         "rule_name": payload.get("ruleName") or payload.get("rule_name"),
-        "location": payload.get("location"),
-        "device_name": payload.get("deviceName"),
-        "user_name": payload.get("userName"),
+        "location": get_payload_location(payload),
+        "device_name": get_payload_device_name(payload),
+        "user_name": get_payload_user_name(payload),
         "message": payload.get("message"),
         "description": payload.get("description"),
         "text": payload.get("text"),
@@ -665,6 +669,46 @@ def get_payload_alert_id(payload):
     return payload.get("alertId") or payload.get("alert_id") or payload.get("id")
 
 
+def first_named_item_value(items):
+    if not isinstance(items, list) or not items:
+        return None
+    first_item = items[0]
+    if not isinstance(first_item, dict):
+        return None
+    return first_item.get("name")
+
+
+def get_payload_location(payload):
+    location = payload.get("location")
+    if location not in (None, ""):
+        return location
+    return first_named_item_value(payload.get("locations"))
+
+
+def first_device_value(payload, key):
+    devices = payload.get("devices")
+    if not isinstance(devices, list) or not devices:
+        return None
+    first_device = devices[0]
+    if not isinstance(first_device, dict):
+        return None
+    return first_device.get(key)
+
+
+def get_payload_device_name(payload):
+    device_name = payload.get("deviceName")
+    if device_name not in (None, ""):
+        return device_name
+    return first_device_value(payload, "name")
+
+
+def get_payload_user_name(payload):
+    user_name = payload.get("userName")
+    if user_name not in (None, ""):
+        return user_name
+    return first_device_value(payload, "userName")
+
+
 def enrich_zscaler_alert_payload(payload):
     if not isinstance(payload, dict):
         return None
@@ -674,11 +718,10 @@ def enrich_zscaler_alert_payload(payload):
         raise RuntimeError("Zscaler alert payload did not include an alert id")
 
     alert_detail = zscaler_api_get_with_refresh(f"/alerts/{alert_id}")
-    locations = alert_detail.get("locations") if isinstance(alert_detail, dict) else None
-    if isinstance(locations, list) and locations:
-        first_location = locations[0]
-        if isinstance(first_location, dict):
-            payload["location"] = first_location.get("name")
+    if isinstance(alert_detail, dict):
+        for key in ("geolocations", "locations", "departments"):
+            if key in alert_detail:
+                payload[key] = alert_detail[key]
 
     affected_devices = zscaler_api_get_with_refresh(
         f"/alerts/{alert_id}/affected_devices"
@@ -688,17 +731,14 @@ def enrich_zscaler_alert_payload(payload):
         if isinstance(affected_devices, dict)
         else None
     )
-    if isinstance(devices, list) and devices:
-        first_device = devices[0]
-        if isinstance(first_device, dict):
-            payload["deviceName"] = first_device.get("name")
-            payload["userName"] = first_device.get("userName")
+    if isinstance(devices, list):
+        payload["devices"] = devices
 
     return {
         "alert_id": alert_id,
-        "location": payload.get("location"),
-        "device_name": payload.get("deviceName"),
-        "user_name": payload.get("userName"),
+        "location": get_payload_location(payload),
+        "device_name": get_payload_device_name(payload),
+        "user_name": get_payload_user_name(payload),
     }
 
 
@@ -904,13 +944,28 @@ def get_fortinet_rows(limit=100):
         ).fetchall()
 
 
+def get_payload_json(table_name, row_id):
+    with connect_db() as conn:
+        row = conn.execute(
+            f"SELECT payload_json FROM {table_name} WHERE id = ?",
+            (row_id,),
+        ).fetchone()
+    return None if row is None else row["payload_json"]
+
+
 def rows_as_dicts(rows):
     return [dict(row) for row in rows]
 
 
-def numbered_rows(rows):
+def numbered_rows(rows, payload_path=None):
     return [
-        {"record": index, **dict(row)}
+        {
+            "record": index,
+            "payload_json": (
+                f"{payload_path}/{row['id']}/payload" if payload_path else None
+            ),
+            **dict(row),
+        }
         for index, row in enumerate(rows, start=1)
     ]
 
@@ -919,13 +974,15 @@ def render_cell(column, value):
     if value is None:
         return ""
     escaped_value = html.escape(str(value))
+    if column == "payload_json":
+        return f"<a href='{escaped_value}' target='_blank' rel='noopener'>payload_json</a>"
     if column == "log_detail":
         return f"<pre class='log-detail'>{escaped_value}</pre>"
     return escaped_value
 
 
-def render_table(caption, rows, columns):
-    display_rows = numbered_rows(rows)
+def render_table(caption, rows, columns, payload_path=None):
+    display_rows = numbered_rows(rows, payload_path)
     body = [
         "<div class='table-wrap'>",
         f"<table><caption>{html.escape(caption)}</caption><thead><tr>",
@@ -968,9 +1025,11 @@ def render_alert_page(zscaler_rows, fortinet_rows):
         "</style></head><body>"
     )
     body.append("<section>")
-    body.append(render_table("Zscaler alerts", zscaler_rows, DISPLAY_COLUMNS))
+    body.append(render_table("Zscaler alerts", zscaler_rows, DISPLAY_COLUMNS, "/alerts"))
     body.append("</section><section>")
-    body.append(render_table("Fortinet alerts", fortinet_rows, FORTINET_DISPLAY_COLUMNS))
+    body.append(
+        render_table("Fortinet alerts", fortinet_rows, FORTINET_DISPLAY_COLUMNS, "/fortinet")
+    )
     body.append("</section></body></html>")
     return "".join(body)
 
@@ -1027,6 +1086,21 @@ def print_fortinet_alerts(limit):
         )
 
 
+def is_alert_ui_path(path):
+    return (
+        path in (
+            "/alerts",
+            "/alerts.json",
+            "/alerts.csv",
+            "/fortinet",
+            "/fortinet.json",
+            "/fortinet.csv",
+        )
+        or re.fullmatch(r"/alerts/[0-9]+/payload", path) is not None
+        or re.fullmatch(r"/fortinet/[0-9]+/payload", path) is not None
+    )
+
+
 class WebhookHandler(BaseHTTPRequestHandler):
     def _send_bytes(self, status, content_type, body):
         self.send_response(status)
@@ -1035,14 +1109,75 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_auth_required(self):
+        body = b"Authentication required\n"
+        self.send_response(401)
+        self.send_header("content-type", "text/plain; charset=utf-8")
+        self.send_header("content-length", str(len(body)))
+        self.send_header(
+            "www-authenticate",
+            f'Basic realm="{ALERT_UI_AUTH_REALM}", charset="UTF-8"',
+        )
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _has_valid_ui_auth(self):
+        authorization = self.headers.get("Authorization", "")
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() != "basic" or not token:
+            return False
+
+        try:
+            decoded = base64.b64decode(token, validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return False
+
+        username, separator, password = decoded.partition(":")
+        if not separator:
+            return False
+
+        return hmac.compare_digest(
+            username,
+            ALERT_UI_USERNAME,
+        ) and hmac.compare_digest(password, ALERT_UI_PASSWORD)
+
+    def _require_ui_auth(self, path):
+        if not is_alert_ui_path(path):
+            return True
+        if self._has_valid_ui_auth():
+            return True
+        self._send_auth_required()
+        return False
+
+    def _handle_payload_view(self, table_name, row_id):
+        payload_json = get_payload_json(table_name, row_id)
+        if payload_json is None:
+            self._send_bytes(
+                404,
+                "text/plain; charset=utf-8",
+                b"payload_json not found\n",
+            )
+            return
+
+        try:
+            parsed = json.loads(payload_json)
+        except json.JSONDecodeError:
+            body = (payload_json + "\n").encode("utf-8")
+            self._send_bytes(200, "text/plain; charset=utf-8", body)
+            return
+
+        body = json.dumps(parsed, indent=2, sort_keys=True).encode("utf-8")
+        self._send_bytes(200, "application/json; charset=utf-8", body)
+
     def _handle_alert_view(self):
+        path = urllib.parse.urlparse(self.path).path
         rows = get_alert_rows()
         fortinet_rows = get_fortinet_rows()
-        if self.path == "/alerts.json":
+        if path == "/alerts.json":
             body = json.dumps(numbered_rows(rows), indent=2).encode("utf-8")
             self._send_bytes(200, "application/json; charset=utf-8", body)
             return
-        if self.path == "/alerts.csv":
+        if path == "/alerts.csv":
             body = rows_as_csv(rows).encode("utf-8")
             self._send_bytes(200, "text/csv; charset=utf-8", body)
             return
@@ -1050,12 +1185,13 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self._send_bytes(200, "text/html; charset=utf-8", body)
 
     def _handle_fortinet_view(self):
+        path = urllib.parse.urlparse(self.path).path
         rows = get_fortinet_rows()
-        if self.path == "/fortinet.json":
+        if path == "/fortinet.json":
             body = json.dumps(numbered_rows(rows), indent=2).encode("utf-8")
             self._send_bytes(200, "application/json; charset=utf-8", body)
             return
-        if self.path == "/fortinet.csv":
+        if path == "/fortinet.csv":
             body = fortinet_rows_as_csv(rows).encode("utf-8")
             self._send_bytes(200, "text/csv; charset=utf-8", body)
             return
@@ -1141,10 +1277,28 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self.wfile.write(b'{"ok": true}\n')
 
     def do_GET(self):
-        if self.path in ("/alerts", "/alerts.json", "/alerts.csv"):
+        path = urllib.parse.urlparse(self.path).path
+        if not self._require_ui_auth(path):
+            return
+
+        alert_payload_match = re.fullmatch(r"/alerts/([0-9]+)/payload", path)
+        if alert_payload_match:
+            self._handle_payload_view(
+                "webhook_alerts",
+                int(alert_payload_match.group(1)),
+            )
+            return
+        fortinet_payload_match = re.fullmatch(r"/fortinet/([0-9]+)/payload", path)
+        if fortinet_payload_match:
+            self._handle_payload_view(
+                "fortinet_alerts",
+                int(fortinet_payload_match.group(1)),
+            )
+            return
+        if path in ("/alerts", "/alerts.json", "/alerts.csv"):
             self._handle_alert_view()
             return
-        if self.path in ("/fortinet", "/fortinet.json", "/fortinet.csv"):
+        if path in ("/fortinet", "/fortinet.json", "/fortinet.csv"):
             self._handle_fortinet_view()
             return
         self._handle_request()
