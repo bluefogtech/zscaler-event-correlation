@@ -25,8 +25,8 @@ LOG_FILE = "/home/ubuntu/receiver.log"
 PROJECT_WEBHOOK_PATH = "/project-webhook"
 PROJECT_WEBHOOK_LOG_FILE = "/home/ubuntu/project_webhook.log"
 DB_FILE = "/home/ubuntu/alerts.sqlite"
-ALERT_UI_USERNAME = os.environ.get("ALERT_UI_USERNAME", "alerts")
-ALERT_UI_PASSWORD = os.environ.get("ALERT_UI_PASSWORD", "ZDX-alerts-2026!")
+ALERT_UI_USERNAME = os.environ.get("ALERT_UI_USERNAME", "admin")
+ALERT_UI_PASSWORD = os.environ.get("ALERT_UI_PASSWORD", "admin")
 ALERT_UI_AUTH_REALM = "Security alerts"
 CLICKHOUSE_HOST = os.environ.get(
     "CLICKHOUSE_HOST", "dz6sj5iq7e.us-central1.gcp.clickhouse.cloud"
@@ -554,13 +554,28 @@ def store_alert(received_at, client_address, headers, raw_payload, parsed):
     }
 
     columns = ", ".join(values.keys())
-    placeholders = ", ".join(f":{key}" for key in values)
+    select_values = ", ".join(f":{key}" for key in values)
+    duplicate_where = ""
+    if values["alert_id"] not in (None, ""):
+        duplicate_where = (
+            " WHERE NOT EXISTS ("
+            "SELECT 1 FROM webhook_alerts WHERE alert_id = :alert_id AND "
+        )
+        if values["status"] is None:
+            duplicate_where += "status IS NULL"
+        else:
+            duplicate_where += "status = :status"
+        duplicate_where += ")"
+
     with DB_LOCK:
         with connect_db() as conn:
             cursor = conn.execute(
-                f"INSERT INTO webhook_alerts ({columns}) VALUES ({placeholders})",
+                f"INSERT INTO webhook_alerts ({columns}) "
+                f"SELECT {select_values}{duplicate_where}",
                 values,
             )
+            if cursor.rowcount == 0:
+                return None
             row_id = cursor.lastrowid
     store_clickhouse_alert_payload(payload_json, "zscaler payload")
     return row_id
@@ -943,7 +958,7 @@ def migrate_existing_fortinet_payloads():
     return len(migrated_ids)
 
 
-def get_alert_rows(limit=100):
+def get_alert_rows(limit=50):
     with connect_db() as conn:
         return conn.execute(
             f"""
@@ -956,7 +971,7 @@ def get_alert_rows(limit=100):
         ).fetchall()
 
 
-def get_fortinet_rows(limit=100):
+def get_fortinet_rows(limit=50):
     with connect_db() as conn:
         return conn.execute(
             f"""
@@ -1298,23 +1313,27 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
                     if enrichment is None:
                         log(
-                            "Zscaler alert dropped: enrichment incomplete"
+                            "Zscaler alert enrichment incomplete; storing original payload"
                             + (
                                 f" ({enrichment_error})"
                                 if enrichment_error
                                 else ""
                             )
                         )
-                        row_id = None
-                        drop_reason = "enrichment incomplete"
-                    else:
-                        row_id = store_alert(
-                            received_at,
-                            self.client_address,
-                            self.headers,
-                            text,
-                            parsed,
+                    row_id = store_alert(
+                        received_at,
+                        self.client_address,
+                        self.headers,
+                        text,
+                        parsed,
+                    )
+                    if row_id is None:
+                        log(
+                            "Zscaler duplicate alert dropped at insert: "
+                            f"alert_id={alert_id}, status={status}"
                         )
+                        drop_reason = "duplicate alert"
+                    else:
                         drop_reason = None
                 log(f"SQLite row: {row_id}")
                 if row_id is None:
